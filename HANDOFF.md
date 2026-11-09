@@ -15,6 +15,8 @@ The user confirmed that an unattached DataVolume belongs in the tenant namespace
 
 CDI documents `ObjectTransfer` as an API that cluster administrators can use directly. It is a CDI custom resource submitted through the Kubernetes API, not a private endpoint or an undocumented workaround. It moves the DataVolume/PVC association without copying the physical volume data. The API is cluster scoped, so the PoC needs cluster-level RBAC. See [CDI Namespace Transfer](https://github.com/kubevirt/containerized-data-importer/blob/main/doc/namespace-transfer.md).
 
+The current CDI namespace-transfer guide still specifies `cdi.kubevirt.io/v1beta1`, and the CDI API reference marks `ObjectTransfer` as deprecated for removal in v1. No replacement API version is currently documented or served, so the deprecation warning is expected; do not change this resource to `cdi.kubevirt.io/v1` until CDI publishes that API or a replacement.
+
 ## Files created
 
 - [`main.go`](./main.go): CLI and workflow implementation. Required flags are `--tenant`, `--subnet-a`, `--subnet-b`, and `--storage-class`. Optional flags include `--kubeconfig`, `--vm-image`, `--disk-size`, `--memory`, `--timeout`, and `--cleanup`.

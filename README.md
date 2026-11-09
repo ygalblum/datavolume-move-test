@@ -20,6 +20,8 @@ The test VMs use a Fedora containerDisk image with cloud-init. They do not need 
 
 CDI documents direct ObjectTransfer use for cluster administrators. The transfer is cluster scoped and moves the PVC/DataVolume binding; it does not copy the physical volume data.
 
+CDI currently serves ObjectTransfer as `cdi.kubevirt.io/v1beta1` and marks it deprecated for removal in v1. Its current transfer guide has no replacement API, so Kubernetes may emit a deprecation warning when the program creates transfer records. Keep using the served version until CDI publishes a replacement.
+
 ## Run
 
 ```sh
