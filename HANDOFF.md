@@ -11,11 +11,11 @@ Build a small Go PoC that demonstrates one DataVolume moving between namespaces 
 
 The user confirmed that an unattached DataVolume belongs in the tenant namespace and that an attached DataVolume must be bound to a single VM in one namespace. The VMs can use a PoC test image, and resources should remain after success by default.
 
-## ObjectTransfer decision
+## Namespace move implementation
 
-CDI documents `ObjectTransfer` as an API that cluster administrators can use directly. It is a CDI custom resource submitted through the Kubernetes API, not a private endpoint or an undocumented workaround. It moves the DataVolume/PVC association without copying the physical volume data. The API is cluster scoped, so the PoC needs cluster-level RBAC. See [CDI Namespace Transfer](https://github.com/kubevirt/containerized-data-importer/blob/main/doc/namespace-transfer.md).
+The PoC implements the namespace handoff directly because CDI `ObjectTransfer` is deprecated and has no replacement API. For each move it verifies the DataVolume's PVC and PV claimRef, sets the PV reclaim policy to `Retain`, deletes the source DataVolume/PVC, clears the PV claimRef, creates a matching PVC in the target namespace with `spec.volumeName` set, then creates a DataVolume that adopts the pre-populated PVC. This changes Kubernetes bindings only; the PV data is not copied.
 
-The current CDI namespace-transfer guide still specifies `cdi.kubevirt.io/v1beta1`, and the CDI API reference marks `ObjectTransfer` as deprecated for removal in v1. No replacement API version is currently documented or served, so the deprecation warning is expected; do not change this resource to `cdi.kubevirt.io/v1` until CDI publishes that API or a replacement.
+CDI's `DataVolumeClaimAdoption` feature gate must be enabled in `spec.config.featureGates`. The replacement DataVolume and PVC carry CDI adoption/pre-populated annotations so CDI recognizes the existing disk without initializing it again. The PV remains `Retain` after success and cleanup.
 
 ## Files created
 
@@ -24,15 +24,15 @@ The current CDI namespace-transfer guide still specifies `cdi.kubevirt.io/v1beta
 - [`go.mod`](./go.mod) and [`go.sum`](./go.sum): Kubernetes `v0.35.0` dependencies and the direct WebSocket dependency. The KubeVirt `client-go` module was removed because its dependency graph fails resolution and its generated mock imports an API package absent from `client-go v0.35.0`.
 - [`README.md`](./README.md): prerequisites and run instructions.
 
-The default guest image is `quay.io/containerdisks/fedora:latest`. The app uses cloud-init scripts and the KubeVirt serial console to write and verify a unique marker. On success, both VMs are halted with the test disk detached, and the DataVolume is back in the tenant namespace. `--cleanup` deletes the created VMs, DataVolume, and ObjectTransfer records after verification. The PV reclaim policy is restored to its original value.
+The default guest image is `quay.io/containerdisks/fedora:latest`. The app uses cloud-init scripts and the KubeVirt serial console to write and verify a unique marker. On success, both VMs are halted with the test disk detached, and the DataVolume is back in the tenant namespace. `--cleanup` deletes the created VMs and DataVolume; the PV is left protected with reclaim policy `Retain`.
 
 ## Cluster prerequisites
 
 - The three namespaces already exist and are distinct.
-- KubeVirt and CDI are installed, including the CDI `ObjectTransfer` CRD.
+- KubeVirt and CDI are installed, including the DataVolume API, and CDI's `DataVolumeClaimAdoption` feature gate is enabled.
 - The `--storage-class` StorageClass can provision a filesystem PVC.
 - The configured VM containerDisk image is pullable by the cluster.
-- The app identity can create CDI ObjectTransfers at cluster scope, inspect and patch PVs, manage DataVolumes/VMs/PVCs in the involved namespaces, and access the KubeVirt serial console.
+- The app identity can list CDI resources, inspect and patch PVs, manage DataVolumes/VMs/PVCs in the involved namespaces, and access the KubeVirt serial console.
 
 The test VMs do not configure a network interface; guest file I/O and verification use the attached disk and serial console.
 
@@ -52,7 +52,7 @@ go mod tidy
 go build ./...
 ```
 
-Then verify dependency resolution from a separate consumer module with `go get move-dv` (or the published module path), address any compile errors, and run the PoC against a cluster with KubeVirt/CDI and the required RBAC. Confirm that the cluster's CDI version supports direct DataVolume transfers through `ObjectTransfer`.
+Then verify dependency resolution from a separate consumer module with `go get move-dv` (or the published module path), address any compile errors, and run the PoC against a cluster with KubeVirt/CDI, the `DataVolumeClaimAdoption` feature gate, and the required RBAC.
 
 Example invocation:
 

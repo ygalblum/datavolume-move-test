@@ -40,8 +40,8 @@ var (
 	namespacesGVR              = schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
 	pvcsGVR                    = schema.GroupVersionResource{Version: "v1", Resource: "persistentvolumeclaims"}
 	pvsGVR                     = schema.GroupVersionResource{Version: "v1", Resource: "persistentvolumes"}
+	cdisGVR                    = schema.GroupVersionResource{Group: "cdi.kubevirt.io", Version: "v1beta1", Resource: "cdis"}
 	dataVolumesGVR             = schema.GroupVersionResource{Group: "cdi.kubevirt.io", Version: "v1beta1", Resource: "datavolumes"}
-	objectTransfersGVR         = schema.GroupVersionResource{Group: "cdi.kubevirt.io", Version: "v1beta1", Resource: "objecttransfers"}
 	virtualMachinesGVR         = schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines"}
 	virtualMachineInstancesGVR = schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachineinstances"}
 )
@@ -60,18 +60,20 @@ type options struct {
 }
 
 type runner struct {
-	client                dynamic.Interface
-	config                *rest.Config
-	discovery             discovery.DiscoveryInterface
-	opts                  options
-	runID                 string
-	dvName                string
-	vmA                   string
-	vmB                   string
-	marker                string
-	transferNames         []string
-	pvName                string
-	originalReclaimPolicy string
+	client             dynamic.Interface
+	config             *rest.Config
+	discovery          discovery.DiscoveryInterface
+	opts               options
+	runID              string
+	dvName             string
+	vmA                string
+	vmB                string
+	marker             string
+	pvName             string
+	pvcTemplate        *unstructured.Unstructured
+	dvTemplate         *unstructured.Unstructured
+	lastTransferSource string
+	lastTransferTarget string
 }
 
 func main() {
@@ -209,8 +211,11 @@ func (r *runner) preflight(ctx context.Context) error {
 	if err := r.requireAPI(cdiAPIGroupVersion, "datavolumes"); err != nil {
 		return err
 	}
-	if err := r.requireAPI(cdiAPIGroupVersion, "objecttransfers"); err != nil {
-		return fmt.Errorf("CDI ObjectTransfer API is required: %w", err)
+	if err := r.requireAPI(cdiAPIGroupVersion, "cdis"); err != nil {
+		return fmt.Errorf("CDI configuration API is required to check PVC adoption support: %w", err)
+	}
+	if err := r.requireClaimAdoption(ctx); err != nil {
+		return err
 	}
 	if err := r.requireAPI(kubeVirtGroupVersion, "virtualmachines"); err != nil {
 		return err
@@ -235,6 +240,22 @@ func (r *runner) requireAPI(groupVersion, resource string) error {
 	return fmt.Errorf("%s does not serve resource %q", groupVersion, resource)
 }
 
+func (r *runner) requireClaimAdoption(ctx context.Context) error {
+	items, err := r.client.Resource(cdisGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("check CDI DataVolumeClaimAdoption feature gate (requires permission to list CDI resources): %w", err)
+	}
+	for _, cdi := range items.Items {
+		gates, _, _ := unstructured.NestedStringSlice(cdi.Object, "spec", "config", "featureGates")
+		for _, gate := range gates {
+			if gate == "DataVolumeClaimAdoption" {
+				return nil
+			}
+		}
+	}
+	return errors.New("CDI DataVolumeClaimAdoption feature gate must be enabled in spec.config.featureGates to safely adopt the transferred PVC")
+}
+
 func (r *runner) run(ctx context.Context) error {
 	log.Printf("creating halted VMs %s/%s and %s/%s", r.opts.subnetA, r.vmA, r.opts.subnetB, r.vmB)
 	if err := r.createVM(ctx, r.opts.subnetA, r.vmA, "write"); err != nil {
@@ -251,12 +272,12 @@ func (r *runner) run(ctx context.Context) error {
 	if err := r.waitForDataVolume(ctx, r.opts.tenant); err != nil {
 		return err
 	}
-	pvName, reclaimPolicy, err := r.boundPVAndPolicy(ctx, r.opts.tenant)
+	pvName, err := r.boundPV(ctx, r.opts.tenant)
 	if err != nil {
 		return err
 	}
-	r.pvName, r.originalReclaimPolicy = pvName, reclaimPolicy
-	log.Printf("DataVolume is bound to PV %s (original reclaim policy %s)", r.pvName, r.originalReclaimPolicy)
+	r.pvName = pvName
+	log.Printf("DataVolume is bound to PV %s; it will be retained during each namespace move", r.pvName)
 
 	if err := r.transfer(ctx, r.opts.tenant, r.opts.subnetA, "tenant-to-a"); err != nil {
 		return err
@@ -297,21 +318,17 @@ func (r *runner) run(ctx context.Context) error {
 	if err := r.assertPVClaim(ctx, r.opts.tenant); err != nil {
 		return err
 	}
-	if err := r.restoreReclaimPolicy(ctx); err != nil {
-		return err
-	}
-
 	if r.opts.cleanup {
 		if err := r.cleanup(ctx); err != nil {
 			return err
 		}
-		log.Printf("verification succeeded; test VMs, DataVolume, and transfer records were cleaned up")
+		log.Printf("verification succeeded; test VMs and DataVolume were cleaned up; PV %s remains protected with reclaim policy Retain", r.pvName)
 		return nil
 	}
 
 	log.Printf("verification succeeded: marker %q was written by VM A and read by VM B", r.marker)
 	log.Printf("DataVolume returned to tenant namespace %s and is detached", r.opts.tenant)
-	log.Printf("resources retained: VMs %s/%s and %s/%s; DataVolume %s/%s; PV %s", r.opts.subnetA, r.vmA, r.opts.subnetB, r.vmB, r.opts.tenant, r.dvName, r.pvName)
+	log.Printf("resources retained: VMs %s/%s and %s/%s; DataVolume %s/%s; PV %s (reclaim policy Retain)", r.opts.subnetA, r.vmA, r.opts.subnetB, r.vmB, r.opts.tenant, r.dvName, r.pvName)
 	return nil
 }
 
@@ -389,88 +406,363 @@ func hasReadyCondition(obj *unstructured.Unstructured) bool {
 	return false
 }
 
-func (r *runner) boundPVAndPolicy(ctx context.Context, namespace string) (string, string, error) {
+func (r *runner) boundPV(ctx context.Context, namespace string) (string, error) {
 	dv, err := r.client.Resource(dataVolumesGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{})
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	claim, _, _ := unstructured.NestedString(dv.Object, "status", "claimName")
 	if claim == "" {
 		claim = r.dvName
 	}
+	if claim != r.dvName {
+		return "", fmt.Errorf("DataVolume %s/%s uses PVC %q; this PoC requires the PVC name to match the DataVolume name", namespace, r.dvName, claim)
+	}
 	pvc, err := r.client.Resource(pvcsGVR).Namespace(namespace).Get(ctx, claim, metav1.GetOptions{})
 	if err != nil {
-		return "", "", fmt.Errorf("get PVC %s/%s: %w", namespace, claim, err)
+		return "", fmt.Errorf("get PVC %s/%s: %w", namespace, claim, err)
+	}
+	phase, _, _ := unstructured.NestedString(pvc.Object, "status", "phase")
+	if phase != "Bound" {
+		return "", fmt.Errorf("PVC %s/%s is not Bound (phase=%s)", namespace, claim, phase)
 	}
 	pvName, _, _ := unstructured.NestedString(pvc.Object, "spec", "volumeName")
 	if pvName == "" {
-		return "", "", fmt.Errorf("PVC %s/%s is bound without a PV name", namespace, claim)
+		return "", fmt.Errorf("PVC %s/%s is bound without a PV name", namespace, claim)
 	}
 	pv, err := r.client.Resource(pvsGVR).Get(ctx, pvName, metav1.GetOptions{})
 	if err != nil {
-		return "", "", fmt.Errorf("get PV %s: %w", pvName, err)
+		return "", fmt.Errorf("get PV %s: %w", pvName, err)
 	}
-	policy, _, _ := unstructured.NestedString(pv.Object, "spec", "persistentVolumeReclaimPolicy")
-	if policy == "" {
-		policy = "Delete"
+	claimRef, found, _ := unstructured.NestedMap(pv.Object, "spec", "claimRef")
+	if !found || claimRef["namespace"] != namespace || claimRef["name"] != claim {
+		return "", fmt.Errorf("PV %s is not claimed by PVC %s/%s", pvName, namespace, claim)
 	}
-	return pvName, policy, nil
+	pvcUID, _, _ := unstructured.NestedString(pvc.Object, "metadata", "uid")
+	claimUID, _ := claimRef["uid"].(string)
+	if pvcUID != "" && claimUID != "" && pvcUID != claimUID {
+		return "", fmt.Errorf("PV %s claimRef UID does not match PVC %s/%s", pvName, namespace, claim)
+	}
+	return pvName, nil
 }
 
 func (r *runner) transfer(ctx context.Context, sourceNS, targetNS, suffix string) error {
-	name := r.runID + "-" + suffix
-	transfer := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": cdiAPIGroupVersion,
-		"kind":       "ObjectTransfer",
-		"metadata":   map[string]interface{}{"name": name, "labels": map[string]interface{}{appLabel: appLabelValue, runLabel: r.runID}},
-		"spec": map[string]interface{}{
-			"source": map[string]interface{}{"kind": "DataVolume", "namespace": sourceNS, "name": r.dvName},
-			"target": map[string]interface{}{"namespace": targetNS, "name": r.dvName},
-		},
-	}}
-	if _, err := r.client.Resource(objectTransfersGVR).Create(ctx, transfer, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("create ObjectTransfer %s from %s to %s (requires cluster-scoped CDI permissions): %w", name, sourceNS, targetNS, err)
+	r.lastTransferSource, r.lastTransferTarget = sourceNS, targetNS
+	log.Printf("moving DataVolume %s from %s to %s by rebinding PV %s (%s)", r.dvName, sourceNS, targetNS, r.pvName, suffix)
+
+	sourceDV, err := r.getDataVolume(ctx, sourceNS)
+	if err != nil {
+		return err
 	}
-	r.transferNames = append(r.transferNames, name)
-	log.Printf("transferring DataVolume %s from %s to %s using CDI ObjectTransfer", r.dvName, sourceNS, targetNS)
+	targetDV, err := r.getDataVolume(ctx, targetNS)
+	if err != nil {
+		return err
+	}
+	if sourceDV != nil && targetDV != nil {
+		return fmt.Errorf("DataVolume %s exists in both %s and %s", r.dvName, sourceNS, targetNS)
+	}
+	if sourceDV == nil && targetDV != nil {
+		if err := r.waitForDataVolume(ctx, targetNS); err != nil {
+			return err
+		}
+		return r.assertPVClaim(ctx, targetNS)
+	}
+
+	if sourceDV != nil {
+		sourcePVC, err := r.getDataVolumePVC(ctx, sourceNS, sourceDV)
+		if err != nil {
+			return err
+		}
+		pvName, _, _ := unstructured.NestedString(sourcePVC.Object, "spec", "volumeName")
+		if r.pvName == "" {
+			r.pvName = pvName
+		}
+		if pvName != r.pvName {
+			return fmt.Errorf("source PVC %s/%s is bound to PV %s; expected PV %s", sourceNS, r.dvName, pvName, r.pvName)
+		}
+		if err := r.assertPVClaimReference(ctx, sourceNS, sourcePVC); err != nil {
+			return err
+		}
+		r.pvcTemplate = sourcePVC.DeepCopy()
+		r.dvTemplate = sourceDV.DeepCopy()
+	}
+	if r.pvcTemplate == nil || r.dvTemplate == nil || r.pvName == "" {
+		return errors.New("cannot resume namespace move without the original DataVolume and PVC templates")
+	}
+
+	if err := r.protectPV(ctx); err != nil {
+		return err
+	}
+	if err := r.deleteSourceVolume(ctx, sourceNS); err != nil {
+		return err
+	}
+	if err := r.releasePVClaimRef(ctx, sourceNS, targetNS); err != nil {
+		return err
+	}
+	if err := r.createTransferredPVC(ctx, targetNS); err != nil {
+		return err
+	}
+	if err := r.waitForPVCBound(ctx, targetNS); err != nil {
+		return err
+	}
+	if err := r.createTransferredDataVolume(ctx, targetNS); err != nil {
+		return err
+	}
+	if err := r.waitForDataVolume(ctx, targetNS); err != nil {
+		return fmt.Errorf("wait for adopted DataVolume %s/%s: %w", targetNS, r.dvName, err)
+	}
+	return r.assertPVClaim(ctx, targetNS)
+}
+
+func (r *runner) getDataVolume(ctx context.Context, namespace string) (*unstructured.Unstructured, error) {
+	dv, err := r.client.Resource(dataVolumesGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get DataVolume %s/%s: %w", namespace, r.dvName, err)
+	}
+	return dv, nil
+}
+
+func (r *runner) getDataVolumePVC(ctx context.Context, namespace string, dv *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+	claim, _, _ := unstructured.NestedString(dv.Object, "status", "claimName")
+	if claim == "" {
+		claim = r.dvName
+	}
+	if claim != r.dvName {
+		return nil, fmt.Errorf("DataVolume %s/%s uses PVC %q; this PoC requires matching DataVolume and PVC names", namespace, r.dvName, claim)
+	}
+	pvc, err := r.client.Resource(pvcsGVR).Namespace(namespace).Get(ctx, claim, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get source PVC %s/%s: %w", namespace, claim, err)
+	}
+	return pvc, nil
+}
+
+func (r *runner) assertPVClaimReference(ctx context.Context, namespace string, pvc *unstructured.Unstructured) error {
+	pv, err := r.client.Resource(pvsGVR).Get(ctx, r.pvName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get PV %s: %w", r.pvName, err)
+	}
+	claimRef, found, _ := unstructured.NestedMap(pv.Object, "spec", "claimRef")
+	if !found || claimRef["namespace"] != namespace || claimRef["name"] != pvc.GetName() {
+		return fmt.Errorf("PV %s is not claimed by PVC %s/%s", r.pvName, namespace, pvc.GetName())
+	}
+	pvcUID := string(pvc.GetUID())
+	claimUID, _ := claimRef["uid"].(string)
+	if pvcUID != "" && claimUID != "" && pvcUID != claimUID {
+		return fmt.Errorf("PV %s claimRef UID does not match PVC %s/%s", r.pvName, namespace, pvc.GetName())
+	}
+	return nil
+}
+
+func (r *runner) protectPV(ctx context.Context) error {
+	pv, err := r.client.Resource(pvsGVR).Get(ctx, r.pvName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get PV %s before protecting it: %w", r.pvName, err)
+	}
+	policy, _, _ := unstructured.NestedString(pv.Object, "spec", "persistentVolumeReclaimPolicy")
+	if policy == "Retain" {
+		return nil
+	}
+	patch, _ := json.Marshal(map[string]interface{}{"spec": map[string]interface{}{"persistentVolumeReclaimPolicy": "Retain"}})
+	if _, err := r.client.Resource(pvsGVR).Patch(ctx, r.pvName, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("set PV %s reclaim policy to Retain: %w", r.pvName, err)
+	}
+	return nil
+}
+
+func (r *runner) deleteSourceVolume(ctx context.Context, namespace string) error {
+	if err := r.client.Resource(dataVolumesGVR).Namespace(namespace).Delete(ctx, r.dvName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete source DataVolume %s/%s: %w", namespace, r.dvName, err)
+	}
+	if err := poll(ctx, 2*time.Second, func() (bool, error) {
+		_, err := r.client.Resource(dataVolumesGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}); err != nil {
+		return fmt.Errorf("wait for source DataVolume %s/%s deletion: %w", namespace, r.dvName, err)
+	}
+	if err := r.client.Resource(pvcsGVR).Namespace(namespace).Delete(ctx, r.dvName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete source PVC %s/%s: %w", namespace, r.dvName, err)
+	}
+	if err := poll(ctx, 2*time.Second, func() (bool, error) {
+		_, err := r.client.Resource(pvcsGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}); err != nil {
+		return fmt.Errorf("wait for source PVC %s/%s deletion: %w", namespace, r.dvName, err)
+	}
+	return nil
+}
+
+func (r *runner) releasePVClaimRef(ctx context.Context, sourceNS, targetNS string) error {
+	pv, err := r.client.Resource(pvsGVR).Get(ctx, r.pvName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get PV %s before releasing it: %w", r.pvName, err)
+	}
+	claimRef, found, _ := unstructured.NestedMap(pv.Object, "spec", "claimRef")
+	claimNamespace, _ := claimRef["namespace"].(string)
+	claimName, _ := claimRef["name"].(string)
+	if claimNamespace == targetNS && claimName == r.dvName {
+		return nil
+	}
+	if found && len(claimRef) > 0 && (claimNamespace != sourceNS || claimName != r.dvName) {
+		return fmt.Errorf("refusing to clear PV %s claimRef for unexpected PVC %s/%s", r.pvName, claimNamespace, claimName)
+	}
+	if found && len(claimRef) > 0 {
+		patch, _ := json.Marshal(map[string]interface{}{"spec": map[string]interface{}{"claimRef": nil}})
+		if _, err := r.client.Resource(pvsGVR).Patch(ctx, r.pvName, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("clear claimRef from PV %s: %w", r.pvName, err)
+		}
+	}
 	return poll(ctx, 2*time.Second, func() (bool, error) {
-		ot, err := r.client.Resource(objectTransfersGVR).Get(ctx, name, metav1.GetOptions{})
-		if err != nil && !apierrors.IsNotFound(err) {
+		pv, err := r.client.Resource(pvsGVR).Get(ctx, r.pvName, metav1.GetOptions{})
+		if err != nil {
 			return false, err
 		}
-		if err == nil {
-			phase, _, _ := unstructured.NestedString(ot.Object, "status", "phase")
-			if strings.EqualFold(phase, "Failed") {
-				message, _, _ := unstructured.NestedString(ot.Object, "status", "message")
-				return false, fmt.Errorf("ObjectTransfer %s failed: %s", name, message)
-			}
+		claimRef, found, _ := unstructured.NestedMap(pv.Object, "spec", "claimRef")
+		phase, _, _ := unstructured.NestedString(pv.Object, "status", "phase")
+		return (!found || len(claimRef) == 0) && phase == "Available", nil
+	})
+}
+
+func (r *runner) createTransferredPVC(ctx context.Context, namespace string) error {
+	pvc, err := r.client.Resource(pvcsGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{})
+	if err == nil {
+		pvName, _, _ := unstructured.NestedString(pvc.Object, "spec", "volumeName")
+		if pvName != r.pvName || pvc.GetLabels()[runLabel] != r.runID {
+			return fmt.Errorf("target PVC %s/%s already exists and does not belong to this run on PV %s", namespace, r.dvName, r.pvName)
 		}
-		source, sourceErr := r.client.Resource(dataVolumesGVR).Namespace(sourceNS).Get(ctx, r.dvName, metav1.GetOptions{})
-		target, targetErr := r.client.Resource(dataVolumesGVR).Namespace(targetNS).Get(ctx, r.dvName, metav1.GetOptions{})
-		if sourceErr != nil && !apierrors.IsNotFound(sourceErr) {
-			return false, sourceErr
-		}
-		if targetErr != nil && !apierrors.IsNotFound(targetErr) {
-			return false, targetErr
-		}
-		if source != nil || target == nil {
-			return false, nil
-		}
-		claim, _, _ := unstructured.NestedString(target.Object, "status", "claimName")
-		if claim == "" {
-			claim = r.dvName
-		}
-		pvc, err := r.client.Resource(pvcsGVR).Namespace(targetNS).Get(ctx, claim, metav1.GetOptions{})
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("check target PVC %s/%s: %w", namespace, r.dvName, err)
+	}
+
+	pvc = r.pvcTemplate.DeepCopy()
+	sanitizeForCreate(pvc)
+	pvc.SetName(r.dvName)
+	pvc.SetNamespace(namespace)
+	pvcSpec, found, err := unstructured.NestedMap(pvc.Object, "spec")
+	if err != nil || !found {
+		return errors.New("source PVC template has no spec")
+	}
+	pvcSpec["volumeName"] = r.pvName
+	removePopulationSources(pvcSpec)
+	if err := unstructured.SetNestedMap(pvc.Object, pvcSpec, "spec"); err != nil {
+		return fmt.Errorf("set target PVC PV name: %w", err)
+	}
+	annotations := pvc.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	delete(annotations, "cdi.kubevirt.io/createdForDataVolume")
+	delete(annotations, "cdi.kubevirt.io/storage.ownerRef")
+	delete(annotations, "cdi.kubevirt.io/storage.populator.kind")
+	delete(annotations, "cdi.kubevirt.io/storage.populator.pvcPrime")
+	delete(annotations, "pv.kubernetes.io/bind-completed")
+	delete(annotations, "pv.kubernetes.io/bound-by-controller")
+	delete(annotations, "volume.kubernetes.io/selected-node")
+	annotations["cdi.kubevirt.io/allowClaimAdoption"] = "true"
+	annotations["cdi.kubevirt.io/storage.populatedFor"] = r.dvName
+	pvc.SetAnnotations(annotations)
+	labels := pvc.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[appLabel], labels[runLabel] = appLabelValue, r.runID
+	pvc.SetLabels(labels)
+	if _, err := r.client.Resource(pvcsGVR).Namespace(namespace).Create(ctx, pvc, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create target PVC %s/%s for PV %s: %w", namespace, r.dvName, r.pvName, err)
+	}
+	return nil
+}
+
+func (r *runner) waitForPVCBound(ctx context.Context, namespace string) error {
+	return poll(ctx, 2*time.Second, func() (bool, error) {
+		pvc, err := r.client.Resource(pvcsGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{})
 		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
 			return false, err
 		}
 		phase, _, _ := unstructured.NestedString(pvc.Object, "status", "phase")
 		pvName, _, _ := unstructured.NestedString(pvc.Object, "spec", "volumeName")
-		return phase == "Bound" && pvName == r.pvName, nil
+		if pvName != r.pvName {
+			return false, fmt.Errorf("PVC %s/%s references PV %s; expected %s", namespace, r.dvName, pvName, r.pvName)
+		}
+		return phase == "Bound", nil
 	})
+}
+
+func (r *runner) createTransferredDataVolume(ctx context.Context, namespace string) error {
+	existing, err := r.getDataVolume(ctx, namespace)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		if existing.GetLabels()[runLabel] == r.runID {
+			return nil
+		}
+		return fmt.Errorf("target DataVolume %s/%s already exists and does not belong to this run", namespace, r.dvName)
+	}
+
+	dv := r.dvTemplate.DeepCopy()
+	sanitizeForCreate(dv)
+	dv.SetName(r.dvName)
+	dv.SetNamespace(namespace)
+	annotations := dv.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations["cdi.kubevirt.io/allowClaimAdoption"] = "true"
+	annotations["cdi.kubevirt.io/storage.prePopulated"] = r.dvName
+	dv.SetAnnotations(annotations)
+	labels := dv.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[appLabel], labels[runLabel] = appLabelValue, r.runID
+	dv.SetLabels(labels)
+	pvcSpec, found, err := unstructured.NestedMap(r.pvcTemplate.Object, "spec")
+	if err != nil || !found {
+		return errors.New("source PVC template has no spec")
+	}
+	pvcSpec["volumeName"] = r.pvName
+	removePopulationSources(pvcSpec)
+	dvSpec, found, err := unstructured.NestedMap(dv.Object, "spec")
+	if err != nil || !found {
+		return errors.New("source DataVolume template has no spec")
+	}
+	delete(dvSpec, "storage")
+	delete(dvSpec, "sourceRef")
+	dvSpec["pvc"] = pvcSpec
+	if _, found := dvSpec["source"]; !found {
+		dvSpec["source"] = map[string]interface{}{"blank": map[string]interface{}{}}
+	}
+	if err := unstructured.SetNestedMap(dv.Object, dvSpec, "spec"); err != nil {
+		return fmt.Errorf("set target DataVolume PVC spec: %w", err)
+	}
+	if _, err := r.client.Resource(dataVolumesGVR).Namespace(namespace).Create(ctx, dv, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create target DataVolume %s/%s for existing PVC: %w", namespace, r.dvName, err)
+	}
+	return nil
+}
+
+func removePopulationSources(pvcSpec map[string]interface{}) {
+	delete(pvcSpec, "dataSource")
+	delete(pvcSpec, "dataSourceRef")
+}
+
+func sanitizeForCreate(obj *unstructured.Unstructured) {
+	delete(obj.Object, "status")
+	for _, field := range []string{"uid", "resourceVersion", "generation", "creationTimestamp", "deletionTimestamp", "deletionGracePeriodSeconds", "managedFields", "ownerReferences", "finalizers", "selfLink"} {
+		unstructured.RemoveNestedField(obj.Object, "metadata", field)
+	}
 }
 
 func (r *runner) assertPVClaim(ctx context.Context, namespace string) error {
@@ -720,17 +1012,6 @@ func (r *runner) stopAndDetach(ctx context.Context, namespace, vmName string) er
 	return nil
 }
 
-func (r *runner) restoreReclaimPolicy(ctx context.Context) error {
-	if r.pvName == "" || r.originalReclaimPolicy == "" {
-		return nil
-	}
-	patch, _ := json.Marshal(map[string]interface{}{"spec": map[string]interface{}{"persistentVolumeReclaimPolicy": r.originalReclaimPolicy}})
-	if _, err := r.client.Resource(pvsGVR).Patch(ctx, r.pvName, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
-		return fmt.Errorf("restore reclaim policy %s on PV %s: %w", r.originalReclaimPolicy, r.pvName, err)
-	}
-	return nil
-}
-
 func (r *runner) cleanup(ctx context.Context) error {
 	for _, item := range []struct{ namespace, name string }{{r.opts.subnetA, r.vmA}, {r.opts.subnetB, r.vmB}} {
 		if err := r.setVMRunStrategy(ctx, item.namespace, item.name, "Halted"); err != nil && !apierrors.IsNotFound(err) {
@@ -743,11 +1024,6 @@ func (r *runner) cleanup(ctx context.Context) error {
 	}
 	if err := r.client.Resource(dataVolumesGVR).Namespace(r.opts.tenant).Delete(ctx, r.dvName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete tenant DataVolume %s/%s: %w", r.opts.tenant, r.dvName, err)
-	}
-	for _, name := range r.transferNames {
-		if err := r.client.Resource(objectTransfersGVR).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete ObjectTransfer %s: %w", name, err)
-		}
 	}
 	return nil
 }
@@ -798,8 +1074,16 @@ func (r *runner) returnVolumeToTenant(ctx context.Context) error {
 			}
 		}
 	}
-	if err := r.restoreReclaimPolicy(ctx); err != nil {
-		problems = append(problems, err.Error())
+	if current == "" && r.lastTransferTarget != "" && r.pvName != "" && r.pvcTemplate != nil {
+		if err := r.transfer(ctx, r.lastTransferSource, r.lastTransferTarget, "recovery-resume"); err != nil {
+			problems = append(problems, err.Error())
+		} else if r.lastTransferTarget != r.opts.tenant {
+			if err := r.transfer(ctx, r.lastTransferTarget, r.opts.tenant, "recovery-to-tenant"); err != nil {
+				problems = append(problems, err.Error())
+			} else if err := r.assertPVClaim(ctx, r.opts.tenant); err != nil {
+				problems = append(problems, err.Error())
+			}
+		}
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("could not fully restore the test resources: %s", strings.Join(problems, "; "))
