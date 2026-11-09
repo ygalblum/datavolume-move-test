@@ -157,10 +157,6 @@ func (t *consoleWebsocketRoundTripper) RoundTrip(request *http.Request) (*http.R
 		_ = conn.Close()
 		return response, request.Context().Err()
 	}
-	if err := request.Context().Err(); err != nil {
-		_ = conn.Close()
-		return response, err
-	}
 	<-t.done
 	return response, nil
 }
