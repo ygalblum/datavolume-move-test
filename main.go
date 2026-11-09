@@ -513,8 +513,8 @@ func (r *runner) createVM(ctx context.Context, namespace, name, role string) err
 					"domain": map[string]interface{}{
 						"resources": map[string]interface{}{"requests": map[string]interface{}{"memory": r.opts.memory}},
 						"devices": map[string]interface{}{
-							"disks":    baseDisks(),
-							"consoles": []interface{}{map[string]interface{}{"name": "serial0", "type": "serial"}},
+							"disks":                   baseDisks(),
+							"autoattachSerialConsole": true,
 						},
 					},
 					"volumes": baseVolumes(r.opts.vmImage, userData),
