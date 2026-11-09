@@ -505,7 +505,7 @@ func (r *runner) createVM(ctx context.Context, namespace, name, role string) err
 			"labels":    map[string]interface{}{appLabel: appLabelValue, runLabel: r.runID},
 		},
 		"spec": map[string]interface{}{
-			"running": false,
+			"runStrategy": "Halted",
 			"template": map[string]interface{}{
 				"metadata": map[string]interface{}{"labels": map[string]interface{}{"kubevirt.io/vm": name, appLabel: appLabelValue, runLabel: r.runID}},
 				"spec": map[string]interface{}{
@@ -636,16 +636,16 @@ func (r *runner) patchVMTemplate(ctx context.Context, namespace, vmName string, 
 	return nil
 }
 
-func (r *runner) setVMRunning(ctx context.Context, namespace, name string, running bool) error {
-	data, _ := json.Marshal(map[string]interface{}{"spec": map[string]interface{}{"running": running}})
+func (r *runner) setVMRunStrategy(ctx context.Context, namespace, name, runStrategy string) error {
+	data, _ := json.Marshal(map[string]interface{}{"spec": map[string]interface{}{"runStrategy": runStrategy}})
 	if _, err := r.client.Resource(virtualMachinesGVR).Namespace(namespace).Patch(ctx, name, types.MergePatchType, data, metav1.PatchOptions{}); err != nil {
-		return fmt.Errorf("set VM %s/%s running=%t: %w", namespace, name, running, err)
+		return fmt.Errorf("set VM %s/%s runStrategy=%s: %w", namespace, name, runStrategy, err)
 	}
 	return nil
 }
 
 func (r *runner) runVMAndWaitForSignal(ctx context.Context, namespace, vmName, signal string) error {
-	if err := r.setVMRunning(ctx, namespace, vmName, true); err != nil {
+	if err := r.setVMRunStrategy(ctx, namespace, vmName, "Always"); err != nil {
 		return err
 	}
 	if err := r.waitForVMI(ctx, namespace, vmName, true); err != nil {
@@ -707,7 +707,7 @@ func (r *runner) waitForConsoleSignal(ctx context.Context, namespace, vmName, si
 }
 
 func (r *runner) stopAndDetach(ctx context.Context, namespace, vmName string) error {
-	if err := r.setVMRunning(ctx, namespace, vmName, false); err != nil {
+	if err := r.setVMRunStrategy(ctx, namespace, vmName, "Halted"); err != nil {
 		return err
 	}
 	if err := r.waitForVMI(ctx, namespace, vmName, false); err != nil {
@@ -733,7 +733,7 @@ func (r *runner) restoreReclaimPolicy(ctx context.Context) error {
 
 func (r *runner) cleanup(ctx context.Context) error {
 	for _, item := range []struct{ namespace, name string }{{r.opts.subnetA, r.vmA}, {r.opts.subnetB, r.vmB}} {
-		if err := r.setVMRunning(ctx, item.namespace, item.name, false); err != nil && !apierrors.IsNotFound(err) {
+		if err := r.setVMRunStrategy(ctx, item.namespace, item.name, "Halted"); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 		_ = r.waitForVMI(ctx, item.namespace, item.name, false)
@@ -761,7 +761,7 @@ func (r *runner) returnVolumeToTenant(ctx context.Context) error {
 		if item.namespace == "" || item.name == "" {
 			continue
 		}
-		if err := r.setVMRunning(ctx, item.namespace, item.name, false); err != nil && !apierrors.IsNotFound(err) {
+		if err := r.setVMRunStrategy(ctx, item.namespace, item.name, "Halted"); err != nil && !apierrors.IsNotFound(err) {
 			problems = append(problems, err.Error())
 			continue
 		}
