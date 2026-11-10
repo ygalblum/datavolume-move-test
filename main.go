@@ -10,10 +10,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -22,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -56,11 +60,13 @@ type options struct {
 	storageClass string
 	memory       string
 	timeout      time.Duration
+	guestTimeout time.Duration
 	cleanup      bool
 }
 
 type runner struct {
 	client             dynamic.Interface
+	coreClient         kubernetes.Interface
 	config             *rest.Config
 	discovery          discovery.DiscoveryInterface
 	opts               options
@@ -87,6 +93,7 @@ func main() {
 	flag.StringVar(&opts.storageClass, "storage-class", "", "StorageClass for the test DataVolume (required)")
 	flag.StringVar(&opts.memory, "memory", "1Gi", "memory requested by each test VM")
 	flag.DurationVar(&opts.timeout, "timeout", 20*time.Minute, "overall operation timeout")
+	flag.DurationVar(&opts.guestTimeout, "guest-timeout", 4*time.Minute, "maximum time for each VM to boot and report its guest marker")
 	flag.BoolVar(&opts.cleanup, "cleanup", false, "delete the test VMs and DataVolume after successful verification")
 	flag.Parse()
 
@@ -129,6 +136,9 @@ func validateOptions(opts options) error {
 	if opts.timeout <= 0 {
 		return errors.New("--timeout must be positive")
 	}
+	if opts.guestTimeout <= 0 {
+		return errors.New("--guest-timeout must be positive")
+	}
 	return nil
 }
 
@@ -140,6 +150,10 @@ func execute(ctx context.Context, opts options) (retErr error) {
 	client, err := dynamic.NewForConfig(config)
 	if err != nil {
 		return fmt.Errorf("create Kubernetes dynamic client: %w", err)
+	}
+	coreClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes core client: %w", err)
 	}
 	dc, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
@@ -154,12 +168,13 @@ func execute(ctx context.Context, opts options) (retErr error) {
 		return fmt.Errorf("generate verification marker: %w", err)
 	}
 	r := &runner{
-		client:    client,
-		config:    config,
-		discovery: dc,
-		opts:      opts,
-		runID:     "mvdv-" + runID,
-		marker:    "move-dv-" + marker,
+		client:     client,
+		coreClient: coreClient,
+		config:     config,
+		discovery:  dc,
+		opts:       opts,
+		runID:      "mvdv-" + runID,
+		marker:     "move-dv-" + marker,
 	}
 	r.dvName = r.runID + "-disk"
 	r.vmA = r.runID + "-vm-a"
@@ -170,10 +185,13 @@ func execute(ctx context.Context, opts options) (retErr error) {
 	}
 	defer func() {
 		if retErr != nil {
+			log.Printf("operation failed (%v); starting best effort recovery before exit", retErr)
 			recoveryCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer cancel()
 			if recoveryErr := r.returnVolumeToTenant(recoveryCtx); recoveryErr != nil {
 				log.Printf("recovery note: %v", recoveryErr)
+			} else {
+				log.Printf("recovery completed")
 			}
 		}
 	}()
@@ -288,6 +306,7 @@ func (r *runner) run(ctx context.Context) error {
 	if err := r.attachDataVolume(ctx, r.opts.subnetA, r.vmA); err != nil {
 		return err
 	}
+	log.Printf("starting VM A %s/%s and waiting for guest marker %q", r.opts.subnetA, r.vmA, "MOVE_DV_A_OK:"+r.marker)
 	if err := r.runVMAndWaitForSignal(ctx, r.opts.subnetA, r.vmA, "MOVE_DV_A_OK:"); err != nil {
 		return fmt.Errorf("VM A did not write the marker: %w", err)
 	}
@@ -304,6 +323,7 @@ func (r *runner) run(ctx context.Context) error {
 	if err := r.attachDataVolume(ctx, r.opts.subnetB, r.vmB); err != nil {
 		return err
 	}
+	log.Printf("starting VM B %s/%s and waiting for guest marker %q", r.opts.subnetB, r.vmB, "MOVE_DV_B_OK:"+r.marker)
 	if err := r.runVMAndWaitForSignal(ctx, r.opts.subnetB, r.vmB, "MOVE_DV_B_OK:"); err != nil {
 		return fmt.Errorf("VM B could not verify the marker: %w", err)
 	}
@@ -359,14 +379,15 @@ func (r *runner) createDataVolume(ctx context.Context, namespace string) error {
 }
 
 func (r *runner) waitForDataVolume(ctx context.Context, namespace string) error {
-	return poll(ctx, 2*time.Second, func() (bool, error) {
+	label := fmt.Sprintf("DataVolume %s/%s to become ready", namespace, r.dvName)
+	return pollWithProgress(ctx, 2*time.Second, label, func() (bool, string, error) {
 		dv, err := r.client.Resource(dataVolumesGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{})
 		if err != nil {
-			return false, err
+			return false, "DataVolume not available", err
 		}
 		phase, _, _ := unstructured.NestedString(dv.Object, "status", "phase")
 		if strings.EqualFold(phase, "Failed") {
-			return false, fmt.Errorf("DataVolume %s/%s failed", namespace, r.dvName)
+			return false, statusSummary(dv), fmt.Errorf("DataVolume %s/%s failed: %s", namespace, r.dvName, statusSummary(dv))
 		}
 		claim, _, _ := unstructured.NestedString(dv.Object, "status", "claimName")
 		if claim == "" {
@@ -375,19 +396,58 @@ func (r *runner) waitForDataVolume(ctx context.Context, namespace string) error 
 		pvc, err := r.client.Resource(pvcsGVR).Namespace(namespace).Get(ctx, claim, metav1.GetOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				return false, nil
+				return false, fmt.Sprintf("phase=%q, PVC %s not created", phase, claim), nil
 			}
-			return false, err
+			return false, fmt.Sprintf("phase=%q, PVC %s status unavailable", phase, claim), err
 		}
 		pvcPhase, _, _ := unstructured.NestedString(pvc.Object, "status", "phase")
 		if pvcPhase != "Bound" {
-			return false, nil
+			return false, fmt.Sprintf("%s, PVC %s phase=%q", statusSummary(dv), claim, pvcPhase), nil
 		}
 		if strings.EqualFold(phase, "Succeeded") || hasReadyCondition(dv) {
-			return true, nil
+			return true, fmt.Sprintf("%s, PVC %s Bound", statusSummary(dv), claim), nil
 		}
-		return false, nil
+		return false, fmt.Sprintf("%s, PVC %s Bound", statusSummary(dv), claim), nil
 	})
+}
+
+func statusSummary(obj *unstructured.Unstructured) string {
+	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
+	reason, _, _ := unstructured.NestedString(obj.Object, "status", "reason")
+	message, _, _ := unstructured.NestedString(obj.Object, "status", "message")
+	parts := make([]string, 0, 3)
+	if phase != "" {
+		parts = append(parts, "phase="+phase)
+	}
+	if reason != "" {
+		parts = append(parts, "reason="+reason)
+	}
+	if message != "" {
+		parts = append(parts, "message="+message)
+	}
+	conditions, _, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	for _, raw := range conditions {
+		condition, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		typ, _, _ := unstructured.NestedString(condition, "type")
+		state, _, _ := unstructured.NestedString(condition, "status")
+		reason, _, _ := unstructured.NestedString(condition, "reason")
+		message, _, _ := unstructured.NestedString(condition, "message")
+		conditionText := fmt.Sprintf("condition=%s:%s", typ, state)
+		if reason != "" {
+			conditionText += " reason=" + reason
+		}
+		if message != "" {
+			conditionText += " message=" + message
+		}
+		parts = append(parts, conditionText)
+	}
+	if len(parts) == 0 {
+		return "status pending"
+	}
+	return strings.Join(parts, "; ")
 }
 
 func hasReadyCondition(obj *unstructured.Unstructured) bool {
@@ -490,15 +550,19 @@ func (r *runner) transfer(ctx context.Context, sourceNS, targetNS, suffix string
 		return errors.New("cannot resume namespace move without the original DataVolume and PVC templates")
 	}
 
+	log.Printf("protecting PV %s with reclaim policy Retain", r.pvName)
 	if err := r.protectPV(ctx); err != nil {
 		return err
 	}
+	log.Printf("deleting source DataVolume and PVC %s/%s", sourceNS, r.dvName)
 	if err := r.deleteSourceVolume(ctx, sourceNS); err != nil {
 		return err
 	}
+	log.Printf("releasing PV %s claimRef from %s", r.pvName, sourceNS)
 	if err := r.releasePVClaimRef(ctx, sourceNS, targetNS); err != nil {
 		return err
 	}
+	log.Printf("creating target PVC %s/%s for existing PV %s", targetNS, r.dvName, r.pvName)
 	if err := r.createTransferredPVC(ctx, targetNS); err != nil {
 		return err
 	}
@@ -508,6 +572,7 @@ func (r *runner) transfer(ctx context.Context, sourceNS, targetNS, suffix string
 	if err := r.createTransferredDataVolume(ctx, targetNS); err != nil {
 		return err
 	}
+	log.Printf("waiting for adopted DataVolume %s/%s", targetNS, r.dvName)
 	if err := r.waitForDataVolume(ctx, targetNS); err != nil {
 		return fmt.Errorf("wait for adopted DataVolume %s/%s: %w", targetNS, r.dvName, err)
 	}
@@ -577,24 +642,24 @@ func (r *runner) deleteSourceVolume(ctx context.Context, namespace string) error
 	if err := r.client.Resource(dataVolumesGVR).Namespace(namespace).Delete(ctx, r.dvName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete source DataVolume %s/%s: %w", namespace, r.dvName, err)
 	}
-	if err := poll(ctx, 2*time.Second, func() (bool, error) {
+	if err := pollWithProgress(ctx, 2*time.Second, "source DataVolume deletion", func() (bool, string, error) {
 		_, err := r.client.Resource(dataVolumesGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
-			return true, nil
+			return true, "deleted", nil
 		}
-		return false, err
+		return false, "still present", err
 	}); err != nil {
 		return fmt.Errorf("wait for source DataVolume %s/%s deletion: %w", namespace, r.dvName, err)
 	}
 	if err := r.client.Resource(pvcsGVR).Namespace(namespace).Delete(ctx, r.dvName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete source PVC %s/%s: %w", namespace, r.dvName, err)
 	}
-	if err := poll(ctx, 2*time.Second, func() (bool, error) {
+	if err := pollWithProgress(ctx, 2*time.Second, "source PVC deletion", func() (bool, string, error) {
 		_, err := r.client.Resource(pvcsGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
-			return true, nil
+			return true, "deleted", nil
 		}
-		return false, err
+		return false, "still present", err
 	}); err != nil {
 		return fmt.Errorf("wait for source PVC %s/%s deletion: %w", namespace, r.dvName, err)
 	}
@@ -621,14 +686,19 @@ func (r *runner) releasePVClaimRef(ctx context.Context, sourceNS, targetNS strin
 			return fmt.Errorf("clear claimRef from PV %s: %w", r.pvName, err)
 		}
 	}
-	return poll(ctx, 2*time.Second, func() (bool, error) {
+	return pollWithProgress(ctx, 2*time.Second, fmt.Sprintf("PV %s to become Available", r.pvName), func() (bool, string, error) {
 		pv, err := r.client.Resource(pvsGVR).Get(ctx, r.pvName, metav1.GetOptions{})
 		if err != nil {
-			return false, err
+			return false, "PV status unavailable", err
 		}
 		claimRef, found, _ := unstructured.NestedMap(pv.Object, "spec", "claimRef")
 		phase, _, _ := unstructured.NestedString(pv.Object, "status", "phase")
-		return (!found || len(claimRef) == 0) && phase == "Available", nil
+		claim := "claimRef cleared"
+		if found && len(claimRef) > 0 {
+			claim = fmt.Sprintf("claimRef=%s/%s", claimRef["namespace"], claimRef["name"])
+		}
+		state := fmt.Sprintf("phase=%s, %s", phase, claim)
+		return (!found || len(claimRef) == 0) && phase == "Available", state, nil
 	})
 }
 
@@ -685,17 +755,18 @@ func (r *runner) createTransferredPVC(ctx context.Context, namespace string) err
 }
 
 func (r *runner) waitForPVCBound(ctx context.Context, namespace string) error {
-	return poll(ctx, 2*time.Second, func() (bool, error) {
+	return pollWithProgress(ctx, 2*time.Second, fmt.Sprintf("PVC %s/%s to bind to PV %s", namespace, r.dvName, r.pvName), func() (bool, string, error) {
 		pvc, err := r.client.Resource(pvcsGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{})
 		if err != nil {
-			return false, err
+			return false, "PVC status unavailable", err
 		}
 		phase, _, _ := unstructured.NestedString(pvc.Object, "status", "phase")
 		pvName, _, _ := unstructured.NestedString(pvc.Object, "spec", "volumeName")
 		if pvName != r.pvName {
-			return false, fmt.Errorf("PVC %s/%s references PV %s; expected %s", namespace, r.dvName, pvName, r.pvName)
+			state := fmt.Sprintf("phase=%s, volumeName=%s", phase, pvName)
+			return false, state, fmt.Errorf("PVC %s/%s references PV %s; expected %s", namespace, r.dvName, pvName, r.pvName)
 		}
-		return phase == "Bound", nil
+		return phase == "Bound", fmt.Sprintf("phase=%s, volumeName=%s", phase, pvName), nil
 	})
 }
 
@@ -840,43 +911,62 @@ func cloudInitUserData(role, marker, diskSerial string) string {
 		script = fmt.Sprintf(`#!/bin/bash
 set -euo pipefail
 exec > /dev/ttyS0 2>&1
-trap 'echo MOVE_DV_A_ERROR' ERR
-sleep 8
+trap 'rc=$?; echo "MOVE_DV_A_ERROR: rc=$rc line=$LINENO command=$BASH_COMMAND"; exit "$rc"' ERR
+echo MOVE_DV_A_STAGE:script-start
+echo MOVE_DV_A_STAGE:waiting-for-disk path=/dev/disk/by-id/virtio-%s
 disk=/dev/disk/by-id/virtio-%s
 for i in $(seq 1 120); do
   [ -b "$disk" ] && break
   sleep 1
+  if [ "$((i %% 10))" -eq 0 ]; then echo "MOVE_DV_A_STAGE:waiting-for-disk elapsed=${i}s path=$disk"; fi
 done
-if [ ! -b "$disk" ]; then echo MOVE_DV_A_ERROR; exit 1; fi
+if [ ! -b "$disk" ]; then echo "MOVE_DV_A_ERROR: disk-not-found path=$disk"; exit 1; fi
+echo "MOVE_DV_A_STAGE:disk-found path=$disk"
+echo MOVE_DV_A_STAGE:formatting-disk
 mkfs.ext4 -F "$disk"
 mkdir -p /mnt/move-dv
+echo MOVE_DV_A_STAGE:mounting-disk
 mount "$disk" /mnt/move-dv
+echo MOVE_DV_A_STAGE:writing-marker
 printf '%%s\n' '%s' > /mnt/move-dv/marker.txt
 sync
-echo 'MOVE_DV_A_OK:%s'
-`, diskSerial, marker, marker)
+echo MOVE_DV_A_STAGE:marker-written
+for i in $(seq 1 120); do
+  echo 'MOVE_DV_A_OK:%s'
+  sleep 1
+done
+`, diskSerial, diskSerial, marker, marker)
 	} else {
 		script = fmt.Sprintf(`#!/bin/bash
 set -euo pipefail
 exec > /dev/ttyS0 2>&1
-trap 'echo MOVE_DV_B_ERROR' ERR
-sleep 8
+trap 'rc=$?; echo "MOVE_DV_B_ERROR: rc=$rc line=$LINENO command=$BASH_COMMAND"; exit "$rc"' ERR
+echo MOVE_DV_B_STAGE:script-start
+echo MOVE_DV_B_STAGE:waiting-for-disk path=/dev/disk/by-id/virtio-%s
 disk=/dev/disk/by-id/virtio-%s
 for i in $(seq 1 120); do
   [ -b "$disk" ] && break
   sleep 1
+  if [ "$((i %% 10))" -eq 0 ]; then echo "MOVE_DV_B_STAGE:waiting-for-disk elapsed=${i}s path=$disk"; fi
 done
-if [ ! -b "$disk" ]; then echo MOVE_DV_B_ERROR; exit 1; fi
+if [ ! -b "$disk" ]; then echo "MOVE_DV_B_ERROR: disk-not-found path=$disk"; exit 1; fi
+echo "MOVE_DV_B_STAGE:disk-found path=$disk"
 mkdir -p /mnt/move-dv
+echo MOVE_DV_B_STAGE:mounting-disk-read-only
 mount -o ro "$disk" /mnt/move-dv
+echo MOVE_DV_B_STAGE:reading-marker
 actual=$(cat /mnt/move-dv/marker.txt)
 if [ "$actual" = '%s' ]; then
-  echo 'MOVE_DV_B_OK:%s'
+  echo MOVE_DV_B_STAGE:marker-verified
+  for i in $(seq 1 120); do
+    echo 'MOVE_DV_B_OK:%s'
+    sleep 1
+  done
 else
-  echo MOVE_DV_B_ERROR
+  echo MOVE_DV_B_ERROR: marker-mismatch
   exit 1
 fi
-`, diskSerial, marker, marker)
+`, diskSerial, diskSerial, marker, marker)
 	}
 
 	var indented strings.Builder
@@ -937,65 +1027,340 @@ func (r *runner) setVMRunStrategy(ctx context.Context, namespace, name, runStrat
 }
 
 func (r *runner) runVMAndWaitForSignal(ctx context.Context, namespace, vmName, signal string) error {
-	if err := r.setVMRunStrategy(ctx, namespace, vmName, "Always"); err != nil {
+	guestCtx, cancel := context.WithTimeout(ctx, r.opts.guestTimeout)
+	defer cancel()
+	log.Printf("starting guest check for VM %s/%s with timeout %s", namespace, vmName, r.opts.guestTimeout)
+	log.Printf("setting VM %s/%s runStrategy=Always", namespace, vmName)
+	if err := r.setVMRunStrategy(guestCtx, namespace, vmName, "Always"); err != nil {
+		if guestCtx.Err() != nil {
+			r.captureVMDiagnostics(namespace, vmName)
+		}
 		return err
 	}
-	if err := r.waitForVMI(ctx, namespace, vmName, true); err != nil {
+	if err := r.waitForVMI(guestCtx, namespace, vmName, true); err != nil {
+		if guestCtx.Err() != nil {
+			r.captureVMDiagnostics(namespace, vmName)
+		}
 		return err
 	}
-	return r.waitForConsoleSignal(ctx, namespace, vmName, signal)
+	log.Printf("VMI %s/%s is running; opening serial console", namespace, vmName)
+	return r.waitForConsoleSignal(guestCtx, namespace, vmName, signal)
 }
 
 func (r *runner) waitForVMI(ctx context.Context, namespace, vmName string, running bool) error {
-	return poll(ctx, 2*time.Second, func() (bool, error) {
+	target := fmt.Sprintf("VMI %s/%s to be Running", namespace, vmName)
+	if !running {
+		target = fmt.Sprintf("VMI %s/%s to stop", namespace, vmName)
+	}
+	return pollWithProgress(ctx, 2*time.Second, target, func() (bool, string, error) {
 		vmi, err := r.client.Resource(virtualMachineInstancesGVR).Namespace(namespace).Get(ctx, vmName, metav1.GetOptions{})
 		if running {
 			if apierrors.IsNotFound(err) {
-				return false, nil
+				return false, "VMI not created yet", nil
 			}
 			if err != nil {
-				return false, err
+				return false, "VMI status unavailable", err
 			}
 			phase, _, _ := unstructured.NestedString(vmi.Object, "status", "phase")
 			if phase == "Failed" || phase == "Succeeded" {
-				return false, fmt.Errorf("VMI %s/%s entered phase %s", namespace, vmName, phase)
+				return false, statusSummary(vmi), fmt.Errorf("VMI %s/%s entered phase %s (%s)", namespace, vmName, phase, statusSummary(vmi))
 			}
-			return phase == "Running", nil
+			return phase == "Running", statusSummary(vmi), nil
 		}
 		if apierrors.IsNotFound(err) {
-			return true, nil
+			return true, "VMI removed", nil
 		}
 		if err != nil {
-			return false, err
+			return false, "VMI status unavailable", err
 		}
-		return false, nil
+		return false, statusSummary(vmi), nil
 	})
 }
 
 func (r *runner) waitForConsoleSignal(ctx context.Context, namespace, vmName, signal string) error {
+	started := time.Now()
+	log.Printf("opening serial console for %s/%s", namespace, vmName)
 	conn, err := openSerialConsole(ctx, r.config, namespace, vmName)
 	if err != nil {
+		r.captureVMDiagnostics(namespace, vmName)
 		return fmt.Errorf("open serial console for %s/%s: %w", namespace, vmName, err)
 	}
-	defer conn.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetReadDeadline(deadline)
-	}
-	reader := bufio.NewReader(conn)
+	log.Printf("serial console connected to %s/%s; waiting for %q", namespace, vmName, signal+r.marker)
 	var output strings.Builder
 	for {
-		line, readErr := reader.ReadString('\n')
-		output.WriteString(line)
-		if strings.Contains(line, signal+r.marker) {
-			return nil
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = conn.SetReadDeadline(deadline)
 		}
-		if strings.Contains(line, "MOVE_DV_A_ERROR") || strings.Contains(line, "MOVE_DV_B_ERROR") {
-			return fmt.Errorf("guest reported failure; console output: %s", tail(output.String(), 2000))
+		readCh := make(chan consoleReadResult, 32)
+		readDone := make(chan struct{})
+		go readConsoleLines(conn, readCh, readDone)
+		progressTicker := time.NewTicker(10 * time.Second)
+		var readErr error
+		streamEnded := false
+		for {
+			select {
+			case result := <-readCh:
+				if result.line != "" {
+					output.WriteString(result.line)
+					if strings.Contains(result.line, signal+r.marker) {
+						close(readDone)
+						progressTicker.Stop()
+						_ = conn.Close()
+						log.Printf("received guest marker from %s/%s after %s (%d console bytes)", namespace, vmName, time.Since(started).Round(time.Second), output.Len())
+						return nil
+					}
+					if strings.Contains(result.line, "MOVE_DV_A_ERROR") || strings.Contains(result.line, "MOVE_DV_B_ERROR") {
+						close(readDone)
+						progressTicker.Stop()
+						_ = conn.Close()
+						r.captureVMDiagnostics(namespace, vmName)
+						return fmt.Errorf("guest reported failure; console output: %s", tail(output.String(), 2000))
+					}
+				}
+				if result.err != nil {
+					readErr = result.err
+					streamEnded = true
+				}
+			case <-progressTicker.C:
+				vmiState := r.currentVMIState(ctx, namespace, vmName)
+				lastOutput := tail(strings.TrimSpace(output.String()), 240)
+				if lastOutput == "" {
+					lastOutput = "no serial output yet"
+				}
+				log.Printf("still waiting for guest marker from %s/%s after %s (console_bytes=%d, VMI=%s, last_output=%q)", namespace, vmName, time.Since(started).Round(time.Second), output.Len(), vmiState, lastOutput)
+			case <-ctx.Done():
+				close(readDone)
+				progressTicker.Stop()
+				_ = conn.Close()
+				r.captureVMDiagnostics(namespace, vmName)
+				return fmt.Errorf("read serial console; expected %q after %s; console bytes=%d; console output: %s: %w", signal+r.marker, time.Since(started).Round(time.Second), output.Len(), tail(output.String(), 2000), ctx.Err())
+			}
+			if streamEnded {
+				break
+			}
 		}
-		if readErr != nil {
-			return fmt.Errorf("read serial console; expected %q; console output: %s: %w", signal+r.marker, tail(output.String(), 2000), readErr)
+		close(readDone)
+		progressTicker.Stop()
+		_ = conn.Close()
+		log.Printf("serial console disconnected from %s/%s after %s (error=%v, console_bytes=%d); checking VMI and launcher state", namespace, vmName, time.Since(started).Round(time.Second), readErr, output.Len())
+		r.captureVMDiagnostics(namespace, vmName)
+		if ctx.Err() != nil {
+			return fmt.Errorf("read serial console; expected %q after %s; console bytes=%d; console output: %s: %w", signal+r.marker, time.Since(started).Round(time.Second), output.Len(), tail(output.String(), 2000), ctx.Err())
+		}
+		if err := r.waitForVMI(ctx, namespace, vmName, true); err != nil {
+			return fmt.Errorf("serial console disconnected and VMI %s/%s is not running; expected %q after %s; console bytes=%d; console output: %s; console read error: %v: %w", namespace, vmName, signal+r.marker, time.Since(started).Round(time.Second), output.Len(), tail(output.String(), 2000), readErr, err)
+		}
+
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			r.captureVMDiagnostics(namespace, vmName)
+			return fmt.Errorf("read serial console; expected %q after %s; console bytes=%d; console output: %s: %w", signal+r.marker, time.Since(started).Round(time.Second), output.Len(), tail(output.String(), 2000), ctx.Err())
+		case <-timer.C:
+		}
+
+		conn, err = openSerialConsole(ctx, r.config, namespace, vmName)
+		if err != nil {
+			r.captureVMDiagnostics(namespace, vmName)
+			return fmt.Errorf("reopen serial console for %s/%s after disconnect; expected %q after %s; console bytes=%d; console output: %s; previous stream error: %v: %w", namespace, vmName, signal+r.marker, time.Since(started).Round(time.Second), output.Len(), tail(output.String(), 2000), readErr, err)
+		}
+		log.Printf("serial console reconnected to %s/%s after %s; continuing to wait for %q", namespace, vmName, time.Since(started).Round(time.Second), signal+r.marker)
+	}
+}
+
+type consoleReadResult struct {
+	line string
+	err  error
+}
+
+func readConsoleLines(conn net.Conn, results chan<- consoleReadResult, done <-chan struct{}) {
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			select {
+			case results <- consoleReadResult{line: line}:
+			case <-done:
+				return
+			}
+		}
+		if err != nil {
+			select {
+			case results <- consoleReadResult{err: err}:
+			case <-done:
+			}
+			return
 		}
 	}
+}
+
+func (r *runner) currentVMIState(ctx context.Context, namespace, vmName string) string {
+	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	vmi, err := r.client.Resource(virtualMachineInstancesGVR).Namespace(namespace).Get(statusCtx, vmName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return "not found"
+	}
+	if err != nil {
+		return "unavailable: " + err.Error()
+	}
+	return statusSummary(vmi)
+}
+
+func (r *runner) captureVMDiagnostics(namespace, vmName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	log.Printf("collecting best effort diagnostics for VM %s/%s before recovery", namespace, vmName)
+
+	vmiUID := ""
+	vmi, err := r.client.Resource(virtualMachineInstancesGVR).Namespace(namespace).Get(ctx, vmName, metav1.GetOptions{})
+	if err != nil {
+		log.Printf("diagnostic VMI lookup for %s/%s failed: %v", namespace, vmName, err)
+	} else {
+		vmiUID, _, _ = unstructured.NestedString(vmi.Object, "metadata", "uid")
+		nodeName, _, _ := unstructured.NestedString(vmi.Object, "status", "nodeName")
+		log.Printf("diagnostic VMI %s/%s: %s, node=%q", namespace, vmName, statusSummary(vmi), nodeName)
+	}
+
+	events, eventErr := r.coreClient.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{})
+	if eventErr != nil {
+		log.Printf("diagnostic namespace event lookup for %s failed (requires events list permission): %v", namespace, eventErr)
+	}
+	var eventItems []corev1.Event
+	if events != nil {
+		eventItems = events.Items
+	}
+	eventPodNames := launcherPodNamesFromEvents(eventItems, vmName)
+
+	pods, err := r.coreClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "kubevirt.io/domain=" + vmName})
+	if err == nil && len(pods.Items) == 0 {
+		log.Printf("diagnostic pod label lookup for %s/%s found none; searching namespace pods and VMI events", namespace, vmName)
+		pods, err = r.coreClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	}
+	podNames := make(map[string]struct{})
+	if err != nil {
+		log.Printf("diagnostic launcher pod lookup for %s/%s failed (requires pods list permission): %v", namespace, vmName, err)
+	} else {
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if !isLauncherPodForVMI(pod, vmName, vmiUID, eventPodNames) {
+				continue
+			}
+			podNames[pod.Name] = struct{}{}
+			log.Printf("diagnostic pod %s/%s: phase=%s node=%q reason=%q message=%q", namespace, pod.Name, pod.Status.Phase, pod.Spec.NodeName, pod.Status.Reason, pod.Status.Message)
+			for _, status := range pod.Status.ContainerStatuses {
+				log.Printf("diagnostic pod %s/%s container %s: ready=%t restarts=%d state=%s", namespace, pod.Name, status.Name, status.Ready, status.RestartCount, containerStateSummary(status.State))
+			}
+			lines := int64(100)
+			logs, logErr := r.coreClient.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{Container: "compute", TailLines: &lines, Timestamps: true}).Do(ctx).Raw()
+			if logErr != nil {
+				log.Printf("diagnostic compute logs for %s/%s unavailable (requires pods/log get permission): %v", namespace, pod.Name, logErr)
+			} else if len(logs) == 0 {
+				log.Printf("diagnostic compute logs for %s/%s: no output", namespace, pod.Name)
+			} else {
+				log.Printf("diagnostic compute logs for %s/%s (tail, max 12000 bytes):\n%s", namespace, pod.Name, tail(string(logs), 12000))
+			}
+		}
+	}
+	if len(podNames) == 0 {
+		log.Printf("diagnostic launcher pod lookup for %s/%s: no matching pods (event candidates=%v)", namespace, vmName, sortedNames(eventPodNames))
+	}
+
+	if eventErr != nil {
+		return
+	}
+	relevant := make([]corev1.Event, 0, len(eventItems))
+	for _, event := range eventItems {
+		object := event.InvolvedObject
+		if (vmiUID != "" && string(object.UID) == vmiUID) || object.Name == vmName {
+			relevant = append(relevant, event)
+			continue
+		}
+		if _, found := podNames[object.Name]; found {
+			relevant = append(relevant, event)
+		}
+	}
+	sort.SliceStable(relevant, func(i, j int) bool {
+		return eventTimestamp(relevant[i]).After(eventTimestamp(relevant[j]))
+	})
+	if len(relevant) == 0 {
+		log.Printf("diagnostic events for %s/%s: no VM, VMI, or launcher pod events found", namespace, vmName)
+		return
+	}
+	if len(relevant) > 20 {
+		relevant = relevant[:20]
+	}
+	for _, event := range relevant {
+		log.Printf("diagnostic event %s object=%s/%s type=%s reason=%s count=%d message=%q", eventTimestamp(event).Format(time.RFC3339), event.InvolvedObject.Kind, event.InvolvedObject.Name, event.Type, event.Reason, event.Count, tail(event.Message, 1000))
+	}
+}
+
+func launcherPodNamesFromEvents(events []corev1.Event, vmName string) map[string]struct{} {
+	names := make(map[string]struct{})
+	prefix := "virt-launcher-" + vmName + "-"
+	for _, event := range events {
+		if event.InvolvedObject.Kind == "Pod" && strings.HasPrefix(event.InvolvedObject.Name, prefix) {
+			names[event.InvolvedObject.Name] = struct{}{}
+		}
+		for _, field := range strings.Fields(event.Message) {
+			candidate := strings.Trim(field, "\"'.,:;()[]")
+			if strings.HasPrefix(candidate, prefix) {
+				names[candidate] = struct{}{}
+			}
+		}
+	}
+	return names
+}
+
+func isLauncherPodForVMI(pod *corev1.Pod, vmName, vmiUID string, eventPodNames map[string]struct{}) bool {
+	if _, found := eventPodNames[pod.Name]; found {
+		return true
+	}
+	if strings.HasPrefix(pod.Name, "virt-launcher-"+vmName+"-") || pod.Labels["kubevirt.io/domain"] == vmName {
+		return true
+	}
+	if vmiUID != "" && pod.Labels["kubevirt.io/created-by"] == vmiUID {
+		return true
+	}
+	for _, owner := range pod.OwnerReferences {
+		if owner.Kind == "VirtualMachineInstance" && (owner.Name == vmName || (vmiUID != "" && string(owner.UID) == vmiUID)) {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedNames(names map[string]struct{}) []string {
+	result := make([]string, 0, len(names))
+	for name := range names {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func containerStateSummary(state corev1.ContainerState) string {
+	switch {
+	case state.Running != nil:
+		return "running since " + state.Running.StartedAt.Format(time.RFC3339)
+	case state.Waiting != nil:
+		return fmt.Sprintf("waiting reason=%q message=%q", state.Waiting.Reason, state.Waiting.Message)
+	case state.Terminated != nil:
+		return fmt.Sprintf("terminated reason=%q exitCode=%d message=%q", state.Terminated.Reason, state.Terminated.ExitCode, state.Terminated.Message)
+	default:
+		return "unknown"
+	}
+}
+
+func eventTimestamp(event corev1.Event) time.Time {
+	if !event.EventTime.IsZero() {
+		return event.EventTime.Time
+	}
+	if !event.LastTimestamp.IsZero() {
+		return event.LastTimestamp.Time
+	}
+	return event.CreationTimestamp.Time
 }
 
 func (r *runner) stopAndDetach(ctx context.Context, namespace, vmName string) error {
@@ -1037,6 +1402,7 @@ func (r *runner) returnVolumeToTenant(ctx context.Context) error {
 		if item.namespace == "" || item.name == "" {
 			continue
 		}
+		log.Printf("recovery: halting VM %s/%s before restoring the DataVolume", item.namespace, item.name)
 		if err := r.setVMRunStrategy(ctx, item.namespace, item.name, "Halted"); err != nil && !apierrors.IsNotFound(err) {
 			problems = append(problems, err.Error())
 			continue
@@ -1057,6 +1423,7 @@ func (r *runner) returnVolumeToTenant(ctx context.Context) error {
 			continue
 		}
 		if _, err := r.client.Resource(dataVolumesGVR).Namespace(namespace).Get(ctx, r.dvName, metav1.GetOptions{}); err == nil {
+			log.Printf("recovery: found DataVolume %s/%s", namespace, r.dvName)
 			current = namespace
 			if namespace == r.opts.tenant {
 				break
@@ -1066,6 +1433,7 @@ func (r *runner) returnVolumeToTenant(ctx context.Context) error {
 		}
 	}
 	if current != "" && current != r.opts.tenant {
+		log.Printf("recovery: moving DataVolume from %s back to tenant namespace %s", current, r.opts.tenant)
 		if err := r.transfer(ctx, current, r.opts.tenant, "recovery-to-tenant"); err != nil {
 			problems = append(problems, err.Error())
 		} else if r.pvName != "" {
@@ -1075,6 +1443,7 @@ func (r *runner) returnVolumeToTenant(ctx context.Context) error {
 		}
 	}
 	if current == "" && r.lastTransferTarget != "" && r.pvName != "" && r.pvcTemplate != nil {
+		log.Printf("recovery: resuming incomplete move %s -> %s", r.lastTransferSource, r.lastTransferTarget)
 		if err := r.transfer(ctx, r.lastTransferSource, r.lastTransferTarget, "recovery-resume"); err != nil {
 			problems = append(problems, err.Error())
 		} else if r.lastTransferTarget != r.opts.tenant {
@@ -1091,23 +1460,43 @@ func (r *runner) returnVolumeToTenant(ctx context.Context) error {
 	return nil
 }
 
-func poll(ctx context.Context, interval time.Duration, check func() (bool, error)) error {
+func pollWithProgress(ctx context.Context, interval time.Duration, target string, check func() (bool, string, error)) error {
+	const progressInterval = 10 * time.Second
+	started := time.Now()
+	nextProgress := started.Add(progressInterval)
+	var lastState string
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	log.Printf("waiting for %s", target)
 	for {
-		done, err := check()
+		done, state, err := check()
+		if state != "" {
+			lastState = state
+		}
 		if err != nil {
 			return err
 		}
 		if done {
+			log.Printf("completed wait for %s after %s (state: %s)", target, time.Since(started).Round(time.Second), fallbackState(lastState))
 			return nil
+		}
+		if time.Now().After(nextProgress) {
+			log.Printf("still waiting for %s after %s (state: %s)", target, time.Since(started).Round(time.Second), fallbackState(lastState))
+			nextProgress = time.Now().Add(progressInterval)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("timed out waiting for %s after %s (last state: %s): %w", target, time.Since(started).Round(time.Second), fallbackState(lastState), ctx.Err())
 		case <-ticker.C:
 		}
 	}
+}
+
+func fallbackState(state string) string {
+	if state == "" {
+		return "unknown"
+	}
+	return state
 }
 
 func randomHex(bytes int) (string, error) {

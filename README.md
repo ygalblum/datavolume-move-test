@@ -16,6 +16,7 @@ The test VMs use a Fedora containerDisk image with cloud-init. They do not need 
 - KubeVirt and CDI installed, with CDI's `DataVolumeClaimAdoption` feature gate enabled in `spec.config.featureGates`.
 - A StorageClass that can provision a filesystem PVC.
 - Permissions to list CDI resources to check the adoption feature gate, inspect and patch PVs, manage DataVolumes/VMs/PVCs in the involved namespaces, and access the KubeVirt serial console.
+- Optional diagnostic permissions: list Pods and Events in the VM namespaces, and get `pods/log` for launcher pods. The program uses these on a console disconnect, guest error, or timeout to record launcher state, recent related events, and the `compute` container logs before recovery halts the VM. The guest script also emits stage markers while cloud-init starts it and while it discovers, formats, mounts, and checks the disk.
 - The selected VM containerDisk image must be pullable by the cluster.
 
 The handoff changes Kubernetes bindings only; it does not copy the physical volume data. The replacement DataVolume and PVC are marked as pre-populated and eligible for adoption so CDI does not initialize the disk again. The PV remains set to `Retain`, including after `--cleanup` deletes the test DataVolume.
@@ -26,6 +27,6 @@ The handoff changes Kubernetes bindings only; it does not copy the physical volu
 go run . --tenant tenant-ns --subnet-a subnet-a-ns --subnet-b subnet-b-ns --storage-class my-storage-class
 ```
 
-The program uses the active kubeconfig context, or in-cluster credentials when run in a Pod. `--storage-class` is required and selects the StorageClass for the test DataVolume. Optional settings include `--kubeconfig`, `--vm-image`, `--disk-size`, `--memory`, and `--timeout`.
+The program uses the active kubeconfig context, or in-cluster credentials when run in a Pod. `--storage-class` is required and selects the StorageClass for the test DataVolume. Optional settings include `--kubeconfig`, `--vm-image`, `--disk-size`, `--memory`, `--timeout`, and `--guest-timeout`. The overall timeout defaults to 20 minutes; each VM boot and guest-marker check has its own four-minute `--guest-timeout`.
 
 By default, successful runs leave both VMs halted and the detached DataVolume back in the tenant namespace for inspection. Add `--cleanup` to delete the created VMs and DataVolume after verification. The PV remains protected with reclaim policy `Retain`.

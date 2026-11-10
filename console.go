@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -26,6 +27,8 @@ func openSerialConsole(ctx context.Context, config *rest.Config, namespace, name
 	connectCtx, cancel := context.WithTimeout(ctx, serialConsoleTimeout)
 	defer cancel()
 
+	started := time.Now()
+	lastProgress := started
 	var lastErr error
 	for {
 		conn, statusCode, err := openSerialConsoleOnce(connectCtx, config, namespace, name)
@@ -35,6 +38,10 @@ func openSerialConsole(ctx context.Context, config *rest.Config, namespace, name
 		lastErr = err
 		if statusCode != http.StatusBadRequest {
 			return nil, lastErr
+		}
+		if time.Since(lastProgress) >= 5*time.Second {
+			log.Printf("serial console for %s/%s is not ready (HTTP 400); retrying after %s", namespace, name, time.Since(started).Round(time.Second))
+			lastProgress = time.Now()
 		}
 
 		timer := time.NewTimer(time.Second)
